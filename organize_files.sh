@@ -106,3 +106,9 @@ find . -type f -iname '*.mkv' -print0 | while IFS= read -r -d '' file; do
         fi
     fi
 done
+
+# Delete all empty directories in the current location
+find . -type d -empty -delete
+
+# Delete the script
+rm "$0"
