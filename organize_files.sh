@@ -105,6 +105,11 @@ for file in "${files[@]}"; do
     # A previous iteration may have moved this file's parent directory.
     [[ -e $file ]] || { say "skip (already moved): $file"; continue; }
 
+    # Junk that step 1 removes (or would remove, in dry-run mode)
+    case ${file,,} in
+        *sample*|*proof*) continue ;;
+    esac
+
     base=$(basename "$file")
     dir=$(dirname "$file")
     say "Found: $file"
