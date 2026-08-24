@@ -1,114 +1,163 @@
-#!/bin/bash
-shopt -s globstar nullglob
+#!/usr/bin/env bash
+#
+# organize_files.sh — sort .mkv episodes into S01/S02/... folders
+#
+# Usage:
+#   ./organize_files.sh --dry-run    # show what would happen, change nothing
+#   ./organize_files.sh              # do it
+#
+# Run it from the directory that holds the release folders.
 
-# Delete files and folders containing "sample" in their name, as well as .jpg, .png, .jpeg, .txt and .nfo files
-find . -type f \( -iname \*.sample\* -o -iname \*.jpg -o -iname \*.jpeg -o -iname \*.png -o -iname \*.txt -o -iname \*.nfo \) -delete
-find . -type d -iname "*sample*" -exec rm -rf {} +
-find . -type d -iname "*proof*" -exec rm -rf {} +
+set -uo pipefail
 
-# Find all .mkv files in the current and subdirectories
+DRY=0
+case "${1:-}" in
+    -n|--dry-run) DRY=1 ;;
+    -h|--help)    sed -n '2,10p' "$0"; exit 0 ;;
+    "")           ;;
+    *)            echo "unknown option: $1" >&2; exit 2 ;;
+esac
 
-find . -type f -iname '*.mkv' -print0 | while IFS= read -r -d '' file; do
-    # Get the filename without the path
-    filename=$(basename "$file")
-    echo "Found file $file"
+say() { printf '%s\n' "$*"; }
+run() {
+    if (( DRY )); then
+        printf 'DRY  %s\n' "$*"
+    else
+        "$@"
+    fi
+}
 
-    # Check if there is a "Subs", "subs", "Sub", or "sub" folder in the same directory as the .mkv file
-    parent_dir=$(dirname "$file")
-    subs_dir=$(find "$parent_dir" -maxdepth 1 -type d -iname "subs" -o -iname "sub")
+# Everything happens relative to where we were started, not to where the
+# script file happens to live.
+root=$PWD
 
-    # Check if there are files to be renamed first
-    if ! [[ "$filename" =~ [sS][0-9][0-9] ]]; then
-        echo "File has no valid season and episode number: $filename"
-        full_number=$(echo "$file" | rev | find . -type f -name '*.mkv' -exec basename {} \; | grep -oE '[0-9]{3,4}' | grep -v -E '1080|720|265|264' | head -n 1)
-        echo "File: $file"
-        echo "Full number: $full_number"
-        if [[ -n "$full_number" ]]; then
-            if [[ ${#full_number} -eq 3 ]]; then
-                season_number=$(echo "$full_number" | cut -c 1)
-                episode_number=$(echo "$full_number" | cut -c 2,3)
-                echo "Season number: $season_number"
-                echo "Episode number: $episode_number"
-                season_number="S0$season_number"
-                episode_number="E$episode_number"
-            else
-                season_number=$(echo "$full_number" | cut -c 1,2)
-                episode_number=$(echo "$full_number" | cut -c 3,4)
-                echo "Season number: $season_number"
-                echo "Episode number: $episode_number"
-                season_number="S$season_number"
-                episode_number="E$episode_number"
-            fi
-            new_filename=$(echo "$file" | sed "s/\([.-]\| \)$full_number\([.-]\| \)/\1${season_number}${episode_number}\2/")
-            mv "$file" "$new_filename"
-            echo "Renamed $file to $new_filename"
-        fi
-        echo "Now use the new filename: $new_filename"
-        # Check if the file name contains "s0x" (in upper or lowercase)
-    if [[ "$new_filename" =~ [sS][0-9][0-9] ]]; then
-            echo "File has valid season and episode numbers"
-            # Get the folder name (e.g. S01, S02, etc.)
-            foldername=$(echo "$new_filename" | grep -o -E "[sS][0-9][0-9]" | tail -n 1 | tr '[:lower:]' '[:upper:]')
-        
-            # Create the folder if it doesn't exist
-            if [ ! -d "$foldername" ]; then
-                echo "Creating new folder $foldername"
-                mkdir "$foldername"
-            fi
-        
-            if [ "$subs_dir" != "" ]; then
-                # Move the entire folder containing the .mkv file and the "subs" folder to the destination folder
-                echo "Moving $parent_dir to $foldername"
-                mv "$parent_dir" "$foldername"
-            else
-                # Move the file to the season folder
-                echo "Moving $new_filename to $foldername"
-                mv "$new_filename" "$foldername"
-            fi
-        else
-            # Move the file to the location where the script was started
-            if [ "$subs_dir" != "" ]; then
-                mv "$parent_dir" "$(dirname "$0")"
-            else
-                mv "$new_filename" "$(dirname "$0")"
-            fi
-        fi
-    continue
+# --------------------------------------------------------------------------
+# 1. Clean out junk
+# --------------------------------------------------------------------------
+if (( DRY )); then
+    say "DRY  would remove sample/proof dirs and junk files:"
+    find . -depth -type d \( -iname '*sample*' -o -iname '*proof*' \) -printf '     %p\n'
+    find . -type f \( -iname '*sample*' -o -iname '*.jpg' -o -iname '*.jpeg' \
+                   -o -iname '*.png' -o -iname '*.txt' -o -iname '*.nfo' \) -printf '     %p\n'
+else
+    # -depth so we delete children before parents (no "No such file" spam)
+    find . -depth -type d \( -iname '*sample*' -o -iname '*proof*' \) -exec rm -rf {} +
+    find . -type f \( -iname '*sample*' -o -iname '*.jpg' -o -iname '*.jpeg' \
+                   -o -iname '*.png' -o -iname '*.txt' -o -iname '*.nfo' \) -delete
+fi
+
+# --------------------------------------------------------------------------
+# 2. Collect the file list ONCE, before anything moves
+#    (the original streamed find into the loop and then moved whole parent
+#     directories out from under it)
+# --------------------------------------------------------------------------
+mapfile -d '' files < <(find . -type f -iname '*.mkv' -print0)
+
+if (( ${#files[@]} == 0 )); then
+    say "No .mkv files found."
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# 3. Season/episode detection
+# --------------------------------------------------------------------------
+season=''; episode=''; bare_num=''
+
+parse_se() {
+    local base=$1 cleaned n
+    season=''; episode=''; bare_num=''
+
+    # Case A: already tagged, e.g. S01E03 / s1e3 / S01.E03
+    if [[ $base =~ [Ss]([0-9]{1,2})[[:space:]._-]*[Ee]([0-9]{1,3}) ]]; then
+        season=$((10#${BASH_REMATCH[1]}))
+        episode=$((10#${BASH_REMATCH[2]}))
+        return 0
     fi
 
-    # Check if the file name contains "s0x" (in upper or lowercase)
-    if [[ "$filename" =~ [sS][0-9][0-9] ]]; then
-        echo "File has valid a season and episode number"
-        # Get the folder name (e.g. S01, S02, etc.)
-        foldername=$(echo "$filename" | grep -o -E "[sS][0-9][0-9]" | tr '[:lower:]' '[:upper:]')
-      
-        # Create the folder if it doesn't exist
-        if [ ! -d "$foldername" ]; then
-            echo "Creating new folder $foldername"
-            mkdir "$foldername"
-        fi
-      
-        if [ "$subs_dir" != "" ]; then
-            # Move the entire folder containing the .mkv file and the "subs" folder to the destination folder
-            echo "Moving $parent_dir to $foldername"
-            mv "$parent_dir" "$foldername"
-        else
-            # Move the file to the season folder
-            echo "Moving $file to $foldername"
-            mv "$file" "$foldername"
-        fi
+    # Case B: bare number, e.g. 103 -> S01E03, 1204 -> S12E04.
+    # Strip the tokens that look like episode codes but are not, BEFORE
+    # searching. This is what turned "...2022.1204..." into S20E22 before.
+    cleaned=${base%.*}
+    cleaned=$(sed -E '
+        s/(^|[^0-9])(19|20)[0-9]{2}([^0-9]|$)/\1\3/g
+        s/(2160|1080|720|576|480)[pi]?//gI
+        s/[xh]?26[45]//gI
+        s/(DDP?|AAC|AC3|DTS|MP3)[0-9.]*//gI
+    ' <<<"$cleaned")
+
+    n=$(grep -oE '(^|[^0-9])[0-9]{3,4}([^0-9]|$)' <<<"$cleaned" \
+        | grep -oE '[0-9]{3,4}' | head -n 1)
+    [[ -z $n ]] && return 1
+
+    bare_num=$n
+    if (( ${#n} == 3 )); then
+        season=$((10#${n:0:1})); episode=$((10#${n:1:2}))
     else
-        # Move the file to the location where the script was started
-        if [ "$subs_dir" != "" ]; then
-            mv "$parent_dir" "$(dirname "$0")"
-        else
-            mv "$file" "$(dirname "$0")"
+        season=$((10#${n:0:2})); episode=$((10#${n:2:2}))
+    fi
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# 4. Main loop
+# --------------------------------------------------------------------------
+for file in "${files[@]}"; do
+    # A previous iteration may have moved this file's parent directory.
+    [[ -e $file ]] || { say "skip (already moved): $file"; continue; }
+
+    base=$(basename "$file")
+    dir=$(dirname "$file")
+    say "Found: $file"
+
+    if ! parse_se "$base"; then
+        say "  !! no season/episode found — leaving it where it is"
+        continue
+    fi
+
+    tag=$(printf 'S%02dE%02d' "$season" "$episode")
+    folder=$(printf 'S%02d' "$season")
+    say "  -> $tag"
+
+    # Rename only if we inferred the numbers from a bare code
+    if [[ -n $bare_num ]]; then
+        newbase=${base/"$bare_num"/$tag}
+        if [[ $newbase != "$base" ]]; then
+            run mv -n -- "$file" "$dir/$newbase"
+            file="$dir/$newbase"
+            base=$newbase
         fi
+    fi
+
+    # Is there a Subs/Sub/Subtitles folder next to the file?
+    # Note the parentheses — without them the -type d only applied to the
+    # first -iname, so a *file* called "sub" counted as a subtitle folder.
+    subs=''
+    if [[ $dir != "." ]]; then
+        subs=$(find "$dir" -maxdepth 1 -type d \
+                    \( -iname 'subs' -o -iname 'sub' -o -iname 'subtitles' \) \
+                    -print -quit)
+    fi
+
+    run mkdir -p -- "$folder"
+
+    if [[ -n $subs && $dir != "." && $dir != "./$folder" ]]; then
+        say "  moving folder $dir -> $folder/"
+        run mv -n -- "$dir" "$folder/"
+    else
+        say "  moving file $base -> $folder/"
+        run mv -n -- "$file" "$folder/"
     fi
 done
 
-# Delete all empty directories in the current location
-find . -type d -empty -delete
+# --------------------------------------------------------------------------
+# 5. Tidy up
+# --------------------------------------------------------------------------
+if (( DRY )); then
+    say "DRY  would delete empty directories"
+else
+    find . -mindepth 1 -type d -empty -delete
+fi
 
-# Delete the script
-rm "$0"
+# The original ended with `rm "$0"`, which deletes the script after one run.
+# Left out on purpose — uncomment if you really want that.
+# rm -- "$0"
